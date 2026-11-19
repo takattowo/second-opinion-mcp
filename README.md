@@ -1,10 +1,39 @@
 # second-opinion-mcp
 
-An MCP server with one tool, `ask`: send a prompt to another model and get its answer back. Use it to have a
-different model review a diff, check a design, or double-check a fact, from any MCP client (Claude Code, Cursor,
-AWS Quick, Claude Desktop, ...).
+An MCP server that asks another model for a second opinion: have a different model review a diff, check a design,
+or double-check a fact, from any MCP client (Claude Code, Cursor, AWS Quick, Claude Desktop, ...).
 
 One Python file, standard library only, no SDKs.
+
+## Tools
+
+| Tool | What it sends |
+| --- | --- |
+| `ask(model, prompt, system?)` | Only the prompt you give it |
+| `review(model, repo, ref?, paths?, focus?)` | `git diff <ref> -- <paths>`, read by the server itself, with a neutral reviewer prompt |
+
+`review` compares against `HEAD` by default: the uncommitted changes to tracked files. Pass a commit or range
+(`HEAD~1`, `main...my-branch`) to review committed work. Untracked files are never sent; a new file shows up once it
+is staged or committed. `focus` points the reviewer at an area ("error handling") without telling it your verdict.
+
+Every reply comes back wrapped and marked as unverified:
+
+```
+<second_opinion model="sol" input_tokens="1840" output_tokens="212">
+app.py:2 | bug | add() subtracts instead of adding
+</second_opinion>
+Unverified second opinion: check each point against the code before acting on it.
+```
+
+## What leaves your machine
+
+- `ask` sends only the prompt and system prompt. `review` sends the diff, not whole files.
+- `review` leaves out `.env*`, `*.pem` and `*.key` files, even when you name them in `paths`.
+- Before sending, both tools redact your configured API keys and common secret shapes: AWS access keys, private key
+  blocks, `sk-` and `ghp_` style tokens, and `.env`-style `NAME_KEY=value` lines. The reply says how many were
+  redacted. This catches common patterns only; it is not a secret scanner.
+- A prompt over `max_chars` (default 200,000) is refused instead of sent.
+- Redirects are not followed, so the key is only ever sent to `base_url`.
 
 ## Endpoints
 
@@ -27,13 +56,15 @@ Two wire formats cover most providers:
 
 ## Setup
 
-```powershell
+```shell
 git clone https://github.com/takattowo/second-opinion-mcp
 cd second-opinion-mcp
-Copy-Item config.example.json $HOME\.second-opinion.json   # then edit it
+cp config.example.json ~/.second-opinion.json                # macOS / Linux
+Copy-Item config.example.json $HOME\.second-opinion.json     # Windows PowerShell
 ```
 
-Python 3.10+. To run the tests: `pip install pytest`, then `python -m pytest`.
+Then edit the config. Python 3.10+, and git for `review`. To run the tests: `pip install pytest`, then
+`python -m pytest`.
 
 ## Config
 
@@ -41,6 +72,7 @@ The server reads `SECOND_OPINION_CONFIG`, or `~/.second-opinion.json` when that 
 
 ```json
 {
+  "max_chars": 200000,
   "providers": {
     "azure": {"type": "openai", "base_url": "https://<resource>.openai.azure.com/openai/v1", "api_key_env": "AZURE_FOUNDRY_API_KEY"}
   },
@@ -50,6 +82,7 @@ The server reads `SECOND_OPINION_CONFIG`, or `~/.second-opinion.json` when that 
 }
 ```
 
+- **max_chars**: optional, the largest prompt (plus system prompt) that is sent. Default 200,000.
 - **providers**: `type`, `base_url`, `api_key_env` (the name of the environment variable that holds the key), and
   optionally `timeout` in seconds (default 300).
 - **models**: the alias the client picks, mapped to a `provider` and the `model` id. On Azure the model id is your
@@ -63,10 +96,18 @@ See [config.example.json](config.example.json) for all five providers.
 
 ## Add it to your MCP client
 
+Claude Code:
+
+```shell
+claude mcp add --transport stdio --env AZURE_FOUNDRY_API_KEY=<key> second-opinion -- python /path/to/second_opinion.py
+```
+
+Other clients:
+
 ```json
 "second-opinion": {
   "command": "python",
-  "args": ["<repo>/second_opinion.py"],
+  "args": ["/path/to/second_opinion.py"],
   "env": {"AZURE_FOUNDRY_API_KEY": "<key>"}
 }
 ```
@@ -75,20 +116,12 @@ Use the full path to `python` if the client's PATH doesn't include it. If you in
 (`pip install .`), the command is `second-opinion-mcp` with no arguments. Restart the client after changing the
 config: the model list is read at startup.
 
-## The `ask` tool
-
-| Argument | |
-| --- | --- |
-| `model` | One of the configured aliases (the client sees them as a list) |
-| `prompt` | The question. The other model sees only this, so include the code, diff or context |
-| `system` | Optional system prompt, e.g. "You are a strict code reviewer" |
-
-Errors (missing key, HTTP errors with the provider's message, unknown model) come back as tool errors, so the
-calling model can read them and fix the call. Redirects are not followed, so the key is only ever sent to
-`base_url`.
+Errors (missing key, HTTP errors with the provider's message, unknown model, nothing to review) come back as tool
+errors, so the calling model can read them and fix the call.
 
 ## Limits
 
 - Text in, text out: no images, tools or streaming.
 - `openai` type uses Chat Completions. A model that only supports the Responses API won't work.
-- One request at a time; a slow model holds up the next call.
+- Rate limits and server errors (429, 5xx) are retried once, after the `Retry-After` the server asks for (at most
+  30 seconds).
