@@ -87,6 +87,9 @@ The server reads `SECOND_OPINION_CONFIG`, or `~/.second-opinion.json` when that 
 ```
 
 - **max_chars**: optional, the largest prompt (plus system prompt) that is sent. Default 200,000.
+- **log**: optional, `tokens` (default), `full` or `off`. See [Usage log](#usage-log).
+- **log_file**: optional, where the log goes. Default `~/.second-opinion-log.jsonl`; a relative path is next to the
+  config file.
 - **providers**: `type`, `base_url`, `api_key_env` (the name of the environment variable that holds the key), and
   optionally `timeout` in seconds (default 300).
 - **models**: the alias the client picks, mapped to a `provider` and the `model` id. On Azure the model id is your
@@ -122,6 +125,24 @@ config: the model list is read at startup.
 
 Errors (missing key, HTTP errors with the provider's message, unknown model, nothing to review) come back as tool
 errors, so the calling model can read them and fix the call.
+
+## Usage log
+
+Each tool call appends one JSON line to `log_file`, failed calls included:
+
+```json
+{"time": "2026-01-05T14:03:11+07:00", "tool": "review", "model": "sol", "repo": "/path/to/repo", "ref": "HEAD",
+ "paths": null, "model_id": "gpt-6.2-sol", "input_tokens": 1840, "output_tokens": 212, "redacted": 0, "ok": true,
+ "seconds": 17.7}
+```
+
+| `log` | What is saved |
+| --- | --- |
+| `tokens` (default) | Time, tool, model, tokens, duration, ok or the error, how many secrets were redacted, and for `review` the repo, ref and paths |
+| `full` | All of that, plus the prompt and system prompt as sent (after redaction) and the reply |
+| `off` | Nothing |
+
+`full` stores the code you sent, so keep the log out of git and anywhere shared.
 
 ## Limits
 

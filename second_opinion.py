@@ -14,12 +14,16 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 __version__ = "0.2.0"
 TYPES = ("openai", "anthropic")
 PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")  # newest first
 DEFAULT_CONFIG = Path.home() / ".second-opinion.json"
+DEFAULT_LOG = Path.home() / ".second-opinion-log.jsonl"
+LOG_MODES = ("off", "tokens", "full")
+_log_lock = threading.Lock()
 DEFAULT_MAX_CHARS = 200_000
 UNVERIFIED = "Unverified second opinion: check each point against the code before acting on it."
 REVIEW_SYSTEM = ("You are reviewing a code change you have not seen before. Look for real bugs, security problems and "
@@ -66,6 +70,10 @@ def load_config(path=None):
     max_chars = config.get("max_chars", DEFAULT_MAX_CHARS)
     if type(max_chars) is not int or max_chars < 1:
         raise ValueError(f"max_chars must be a positive integer, got {max_chars!r}")
+    if config.get("log", "tokens") not in LOG_MODES:
+        raise ValueError(f"log must be one of {LOG_MODES}, got {config['log']!r}")
+    if "log_file" in config:  # a relative path is next to the config file
+        config["log_file"] = str(path.parent / Path(config["log_file"]).expanduser())
     return config
 
 
@@ -163,25 +171,52 @@ def review_prompt(args):
             + (f"Focus: {focus}\n" if focus else "") + f"\n```diff\n{out.stdout}```")
 
 
+def _log(config, entry):
+    """Append one JSON line per tool call; a log that can't be written never fails the call."""
+    if config.get("log", "tokens") == "off":
+        return
+    path = Path(config.get("log_file") or DEFAULT_LOG)
+    try:
+        with _log_lock, path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"second-opinion-mcp: can't write log {path}: {e}", file=sys.stderr, flush=True)
+
+
 def call_tool(config, name, args):
     alias = args.get("model")
+    entry = {"time": datetime.now().astimezone().isoformat(timespec="seconds"), "tool": name, "model": alias}
     if name == "review":
-        prompt, system = review_prompt(args), REVIEW_SYSTEM
-    else:
-        prompt, system = args.get("prompt", ""), args.get("system")
-    prompt, redacted = scrub(config, prompt)
-    if system:
-        system, more = scrub(config, system)
-        redacted += more
-    size, limit = len(prompt) + len(system or ""), config.get("max_chars", DEFAULT_MAX_CHARS)
-    if size > limit:
-        raise ValueError(f"prompt is {size} chars, over max_chars ({limit}): send a smaller slice, "
-                         "or raise max_chars in the config")
-    text, usage = ask(config, alias, prompt, system)
-    text = re.sub(r"(?i)</second_opinion", "&lt;/second_opinion", text)  # the reply can't end the wrapper early
+        entry.update(repo=args.get("repo"), ref=args.get("ref") or "HEAD", paths=args.get("paths"))
+    started, sent, text = time.monotonic(), (None, None), None
+    try:
+        if name == "review":
+            prompt, system = review_prompt(args), REVIEW_SYSTEM
+        else:
+            prompt, system = args.get("prompt", ""), args.get("system")
+        prompt, redacted = scrub(config, prompt)
+        if system:
+            system, more = scrub(config, system)
+            redacted += more
+        size, limit = len(prompt) + len(system or ""), config.get("max_chars", DEFAULT_MAX_CHARS)
+        if size > limit:
+            raise ValueError(f"prompt is {size} chars, over max_chars ({limit}): send a smaller slice, "
+                             "or raise max_chars in the config")
+        sent = (prompt, system)  # the redacted text, so the log never holds a secret the scrubber caught
+        text, usage = ask(config, alias, prompt, system)
+        entry.update(model_id=config["models"][alias]["model"], **usage, redacted=redacted, ok=True)
+    except Exception as e:
+        entry.update(ok=False, error=f"{type(e).__name__}: {e}")
+        raise
+    finally:
+        entry["seconds"] = round(time.monotonic() - started, 2)
+        if config.get("log", "tokens") == "full":
+            entry.update(prompt=sent[0], system=sent[1], reply=text)
+        _log(config, entry)
+    safe = re.sub(r"(?i)</second_opinion", "&lt;/second_opinion", text)  # the reply can't end the wrapper early
     tokens = "".join(f' {k}="{v}"' for k, v in usage.items() if v is not None)
     note = UNVERIFIED + (f" {redacted} secret(s) were redacted before sending." if redacted else "")
-    return f'<second_opinion model="{alias}"{tokens}>\n{text}\n</second_opinion>\n{note}'
+    return f'<second_opinion model="{alias}"{tokens}>\n{safe}\n</second_opinion>\n{note}'
 
 
 def tools(config):

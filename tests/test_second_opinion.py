@@ -4,6 +4,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -54,6 +55,7 @@ def config_for(url, type_, base_path):
     return {
         "providers": {"p": {"type": type_, "base_url": url + base_path, "api_key_env": "TEST_KEY"}},
         "models": {"m": {"provider": "p", "model": "model-x", "params": {"temperature": 0.2}}},
+        "log": "off",  # the log tests turn it on, so no test writes to the real home folder
     }
 
 
@@ -232,6 +234,77 @@ def test_review_outside_a_repo_is_an_error(fake_api, tmp_path, monkeypatch):
     assert result["isError"] is True
     assert "git diff failed" in text_of(result)
     assert fake_api["requests"] == []
+
+
+def read_log(path):
+    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+
+
+def test_usage_is_logged_without_text_by_default(fake_api, tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_KEY", "sk-test")
+    fake_api["reply"] = OK
+    config = config_for(fake_api["url"], "openai", "/v1")
+    del config["log"]
+    config["log_file"] = str(tmp_path / "log.jsonl")
+
+    call(config, "ask", {"model": "m", "prompt": "hi"})
+
+    [entry] = read_log(tmp_path / "log.jsonl")
+    assert datetime.fromisoformat(entry.pop("time")).tzinfo is not None
+    assert entry.pop("seconds") >= 0
+    assert entry == {"tool": "ask", "model": "m", "model_id": "model-x", "input_tokens": 11, "output_tokens": 3,
+                     "redacted": 0, "ok": True}
+
+
+def test_full_log_keeps_the_redacted_text(fake_api, tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_KEY", "sk-test")
+    fake_api["reply"] = OK
+    config = config_for(fake_api["url"], "openai", "/v1")
+    config.update(log="full", log_file=str(tmp_path / "log.jsonl"))
+
+    call(config, "ask", {"model": "m", "prompt": "key " "AKIA" "ABCDEFGHIJKLMNOP here", "system": "be strict"})
+
+    [entry] = read_log(tmp_path / "log.jsonl")
+    assert (entry["prompt"], entry["system"], entry["reply"]) == ("key [REDACTED] here", "be strict", "ok")
+    assert entry["redacted"] == 1
+
+
+def test_log_off_writes_nothing(fake_api, tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_KEY", "sk-test")
+    fake_api["reply"] = OK
+    config = config_for(fake_api["url"], "openai", "/v1")
+    config["log_file"] = str(tmp_path / "log.jsonl")
+
+    call(config, "ask", {"model": "m", "prompt": "hi"})
+
+    assert not (tmp_path / "log.jsonl").exists()
+
+
+def test_failed_call_is_logged(fake_api, tmp_path, monkeypatch):
+    monkeypatch.delenv("TEST_KEY", raising=False)
+    config = config_for(fake_api["url"], "openai", "/v1")
+    config.update(log="full", log_file=str(tmp_path / "log.jsonl"))
+
+    result = call(config, "ask", {"model": "m", "prompt": "hi"})
+
+    assert result["isError"] is True
+    [entry] = read_log(tmp_path / "log.jsonl")
+    assert entry["ok"] is False
+    assert "TEST_KEY" in entry["error"]
+    assert entry["reply"] is None
+
+
+def test_review_is_logged_with_its_repo_and_ref(fake_api, repo, tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_KEY", "sk-test")
+    fake_api["reply"] = OK
+    config = config_for(fake_api["url"], "openai", "/v1")
+    config.update(log="tokens", log_file=str(tmp_path / "log.jsonl"))
+
+    call(config, "review", {"model": "m", "repo": str(repo), "paths": ["app.py"]})
+
+    [entry] = read_log(tmp_path / "log.jsonl")
+    assert (entry["tool"], entry["repo"], entry["ref"], entry["paths"]) == ("review", str(repo), "HEAD", ["app.py"])
+    assert "prompt" not in entry
 
 
 def test_tool_result_is_wrapped_and_marked_unverified(fake_api, monkeypatch):
@@ -448,6 +521,8 @@ def test_config_with_unknown_provider_is_rejected(tmp_path):
     ({"providers": [], "models": {}}, "providers"),
     ({"providers": {"p": {"type": "openai", "base_url": "x", "api_key_env": "K"}},
       "models": {"m": {"provider": "p", "model": "x"}}, "max_chars": 0}, "max_chars"),
+    ({"providers": {"p": {"type": "openai", "base_url": "x", "api_key_env": "K"}},
+      "models": {"m": {"provider": "p", "model": "x"}}, "log": "verbose"}, "log"),
 ])
 def test_incomplete_config_is_rejected(tmp_path, config, message):
     path = tmp_path / "config.json"
@@ -459,6 +534,13 @@ def test_incomplete_config_is_rejected(tmp_path, config, message):
 
 def test_example_config_is_valid():
     second_opinion.load_config(Path(__file__).parent.parent / "config.example.json")
+
+
+def test_relative_log_file_is_next_to_the_config(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({**config_for("http://127.0.0.1:9", "openai", "/v1"), "log_file": "usage.jsonl"}))
+
+    assert second_opinion.load_config(path)["log_file"] == str(tmp_path / "usage.jsonl")
 
 
 def test_config_with_unknown_type_is_rejected(tmp_path):
