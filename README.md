@@ -34,6 +34,8 @@ Unverified second opinion: check each point against the code before acting on it
   redacted. This catches common patterns only; it is not a secret scanner.
 - A prompt over `max_chars` (default 200,000) is refused instead of sent.
 - Redirects are not followed, so the key is only ever sent to `base_url`.
+- `review` runs `git diff` in the repo you name, so only point it at repos you trust: a repo's own git config can
+  run filters, as it can for any git command there.
 
 ## Endpoints
 

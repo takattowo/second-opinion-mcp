@@ -157,6 +157,32 @@ def test_review_sends_the_tracked_diff_without_secret_files(fake_api, repo, monk
         assert hidden not in user
 
 
+def test_review_does_not_inline_submodule_files(fake_api, repo, tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_KEY", "sk-test")
+    fake_api["reply"] = OK
+    env = {**os.environ, "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
+           "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com"}
+
+    def git(where, *args):
+        subprocess.run(["git", "-C", str(where), *args], check=True, capture_output=True, env=env)
+
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / ".env").write_text("NAME=one\n")
+    git(sub, "init", "-q")
+    git(sub, "add", ".env")
+    git(sub, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "init")
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "sub")
+    git(repo, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "add sub")
+    (repo / "sub" / ".env").write_text("NAME=from-submodule\n")
+    git(repo, "config", "diff.submodule", "diff")
+
+    result = call(config_for(fake_api["url"], "openai", "/v1"), "review", {"model": "m", "repo": str(repo)})
+
+    assert result["isError"] is False
+    assert "from-submodule" not in sent_prompt(fake_api)
+
+
 def test_review_of_only_excluded_files_is_an_error(fake_api, repo, monkeypatch):
     monkeypatch.setenv("TEST_KEY", "sk-test")
 
@@ -206,15 +232,16 @@ def test_secrets_are_redacted_before_sending(fake_api, monkeypatch):
     prompt = ("aws = 'AKIAIOSFODNN7EXAMPLE'\n"
               "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----\n"
               "+DB_PASSWORD=hunter2hunter2\n"
+              "PASSWORD=hunter3hunter3\n"
               "leaked = 'configured-key-value-123'\n")
 
     result = call(config_for(fake_api["url"], "openai", "/v1"), "ask", {"model": "m", "prompt": prompt})
 
     sent = sent_prompt(fake_api)
-    for secret in ("AKIAIOSFODNN7EXAMPLE", "MIIEow", "hunter2hunter2", "configured-key-value-123"):
+    for secret in ("AKIAIOSFODNN7EXAMPLE", "MIIEow", "hunter2hunter2", "hunter3hunter3", "configured-key-value-123"):
         assert secret not in sent
     assert "DB_PASSWORD=[REDACTED]" in sent
-    assert "4 secret(s) were redacted" in text_of(result)
+    assert "5 secret(s) were redacted" in text_of(result)
 
 
 def test_ordinary_code_is_not_redacted(fake_api, monkeypatch):
@@ -243,6 +270,17 @@ def test_prompt_over_max_chars_is_refused(fake_api, monkeypatch):
 def test_rate_limit_is_retried_once(fake_api, monkeypatch):
     monkeypatch.setenv("TEST_KEY", "sk-test")
     fake_api["queue"] = [(429, {"Retry-After": "0"}, {"error": "slow down"})]
+    fake_api["reply"] = OK
+
+    result = call(config_for(fake_api["url"], "openai", "/v1"), "ask", {"model": "m", "prompt": "hi"})
+
+    assert result["isError"] is False
+    assert len(fake_api["requests"]) == 2
+
+
+def test_malformed_retry_after_still_retries(fake_api, monkeypatch):
+    monkeypatch.setenv("TEST_KEY", "sk-test")
+    fake_api["queue"] = [(503, {"Retry-After": "nan"}, {})]
     fake_api["reply"] = OK
 
     result = call(config_for(fake_api["url"], "openai", "/v1"), "ask", {"model": "m", "prompt": "hi"})

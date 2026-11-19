@@ -5,6 +5,7 @@ Two wire formats cover the common endpoints:
   anthropic  POST {base_url}/v1/messages       (Anthropic, Claude on Azure Foundry)
 """
 import json
+import math
 import os
 import re
 import subprocess
@@ -35,7 +36,7 @@ SECRET_PATTERNS = [
     (re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{20,}"), "[REDACTED]"),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}"), "[REDACTED]"),
     # .env-style NAME_KEY=value lines (diff +/- prefix allowed); the value must look like a literal, so code is kept
-    (re.compile(r"(?m)^([-+ ]?\s*(?:export\s+)?[A-Z][A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD)[A-Z0-9_]*"
+    (re.compile(r"(?m)^([-+ ]?\s*(?:export\s+)?[A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD)[A-Z0-9_]*"
                 r"\s*[=:]\s*[\"']?)[A-Za-z0-9_./+=-]{8,}(?=[\"'\s]|$)"), r"\1[REDACTED]"),
 ]
 
@@ -76,9 +77,10 @@ _opener = urllib.request.build_opener(_NoRedirect)
 
 def _retry_delay(value):
     try:
-        return min(max(float(value), 0), 30)
+        delay = float(value)
     except (TypeError, ValueError):
         return 1  # no Retry-After, or an HTTP date
+    return min(max(delay, 0), 30) if math.isfinite(delay) else 1
 
 
 def _post(url, headers, body, timeout):
@@ -146,8 +148,8 @@ def review_prompt(args):
     repo, ref, paths = args.get("repo"), args.get("ref") or "HEAD", args.get("paths") or ["."]
     if not isinstance(paths, list) or any(str(p).startswith("-") for p in [ref, *paths]):
         raise ValueError("ref and paths can't start with '-', and paths must be a list")
-    out = subprocess.run(["git", "-C", str(repo), "diff", "--no-color", "--no-ext-diff", "--no-textconv", str(ref),
-                          "--", *map(str, paths), *EXCLUDE],
+    out = subprocess.run(["git", "-C", str(repo), "diff", "--no-color", "--no-ext-diff", "--no-textconv",
+                          "--submodule=short", str(ref), "--", *map(str, paths), *EXCLUDE],
                          capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
     if out.returncode:
         raise RuntimeError(f"git diff failed: {out.stderr.strip()[:1000]}")
