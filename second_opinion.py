@@ -55,7 +55,7 @@ def _post(url, headers, body, timeout):
         with _opener.open(request, timeout=timeout) as response:
             return json.load(response)
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f"HTTP {e.code} from {url}: {e.read().decode(errors='replace')[:2000]}") from None
+        raise RuntimeError(f"HTTP {e.code} from {url}: {e.read(2000).decode(errors='replace')}") from None
 
 
 def ask(config, alias, prompt, system=None):
