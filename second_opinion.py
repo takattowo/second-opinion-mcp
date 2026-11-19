@@ -73,7 +73,9 @@ def load_config(path=None):
     if config.get("log", "tokens") not in LOG_MODES:
         raise ValueError(f"log must be one of {LOG_MODES}, got {config['log']!r}")
     if "log_file" in config:  # a relative path is next to the config file
-        config["log_file"] = str(path.parent / Path(config["log_file"]).expanduser())
+        if not isinstance(config["log_file"], str) or not config["log_file"].strip():
+            raise ValueError(f"log_file must be a file path, got {config['log_file']!r}")
+        config["log_file"] = str(path.resolve().parent / Path(config["log_file"]).expanduser())
     return config
 
 
@@ -176,10 +178,11 @@ def _log(config, entry):
     if config.get("log", "tokens") == "off":
         return
     path = Path(config.get("log_file") or DEFAULT_LOG)
+    # shortcut: the lock covers one server; servers sharing a log can interleave long lines, give each its own log_file
     try:
         with _log_lock, path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except OSError as e:
+            f.write(json.dumps(entry) + "\n")  # ASCII escapes, so text that isn't valid UTF-8 still writes
+    except Exception as e:
         print(f"second-opinion-mcp: can't write log {path}: {e}", file=sys.stderr, flush=True)
 
 
@@ -198,13 +201,15 @@ def call_tool(config, name, args):
         if system:
             system, more = scrub(config, system)
             redacted += more
+        entry.update(model_id=config["models"][alias]["model"] if alias in config["models"] else None,
+                     redacted=redacted)
         size, limit = len(prompt) + len(system or ""), config.get("max_chars", DEFAULT_MAX_CHARS)
         if size > limit:
             raise ValueError(f"prompt is {size} chars, over max_chars ({limit}): send a smaller slice, "
                              "or raise max_chars in the config")
         sent = (prompt, system)  # the redacted text, so the log never holds a secret the scrubber caught
         text, usage = ask(config, alias, prompt, system)
-        entry.update(model_id=config["models"][alias]["model"], **usage, redacted=redacted, ok=True)
+        entry.update(**usage, ok=True)
     except Exception as e:
         entry.update(ok=False, error=f"{type(e).__name__}: {e}")
         raise

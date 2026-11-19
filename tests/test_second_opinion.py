@@ -292,6 +292,31 @@ def test_failed_call_is_logged(fake_api, tmp_path, monkeypatch):
     assert entry["ok"] is False
     assert "TEST_KEY" in entry["error"]
     assert entry["reply"] is None
+    assert (entry["model_id"], entry["redacted"]) == ("model-x", 0)
+
+
+def test_unwritable_log_does_not_fail_the_call(fake_api, tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_KEY", "sk-test")
+    fake_api["reply"] = OK
+    config = config_for(fake_api["url"], "openai", "/v1")
+    config.update(log="tokens", log_file=str(tmp_path))  # a folder, so opening it fails
+
+    result = call(config, "ask", {"model": "m", "prompt": "hi"})
+
+    assert result["isError"] is False
+
+
+def test_text_that_is_not_valid_utf8_is_still_logged(fake_api, tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_KEY", "sk-test")
+    fake_api["reply"] = OK
+    config = config_for(fake_api["url"], "openai", "/v1")
+    config.update(log="full", log_file=str(tmp_path / "log.jsonl"))
+
+    result = call(config, "ask", {"model": "m", "prompt": "half an emoji \ud83d"})
+
+    assert result["isError"] is False
+    [entry] = read_log(tmp_path / "log.jsonl")
+    assert entry["prompt"] == "half an emoji \ud83d"
 
 
 def test_review_is_logged_with_its_repo_and_ref(fake_api, repo, tmp_path, monkeypatch):
@@ -523,6 +548,8 @@ def test_config_with_unknown_provider_is_rejected(tmp_path):
       "models": {"m": {"provider": "p", "model": "x"}}, "max_chars": 0}, "max_chars"),
     ({"providers": {"p": {"type": "openai", "base_url": "x", "api_key_env": "K"}},
       "models": {"m": {"provider": "p", "model": "x"}}, "log": "verbose"}, "log"),
+    ({"providers": {"p": {"type": "openai", "base_url": "x", "api_key_env": "K"}},
+      "models": {"m": {"provider": "p", "model": "x"}}, "log_file": ""}, "log_file"),
 ])
 def test_incomplete_config_is_rejected(tmp_path, config, message):
     path = tmp_path / "config.json"
