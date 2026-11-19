@@ -7,6 +7,7 @@ Two wire formats cover the common endpoints:
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -20,6 +21,12 @@ PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")  # newest first
 DEFAULT_CONFIG = Path.home() / ".second-opinion.json"
 DEFAULT_MAX_CHARS = 200_000
 UNVERIFIED = "Unverified second opinion: check each point against the code before acting on it."
+REVIEW_SYSTEM = ("You are reviewing a code change you have not seen before. Look for real bugs, security problems and "
+                 "missed edge cases; ignore style unless it hides a bug. Report each finding on its own line as "
+                 "`file:line | severity | issue`, with severity blocker, bug or minor. Say when a finding depends on "
+                 "code outside the diff. If you find nothing, reply `no findings`.")
+# never sent by review, even when named in paths
+EXCLUDE = (":(exclude,glob)**/.env*", ":(exclude,glob)**/*.pem", ":(exclude,glob)**/*.key")
 # shortcut: common secret shapes only, not a full scanner; add patterns as new key formats turn up
 SECRET_PATTERNS = [
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
@@ -134,8 +141,29 @@ def scrub(config, text):
     return text, count
 
 
+def review_prompt(args):
+    """Build the review prompt from `git diff <ref> -- <paths>` in the repo: tracked files only."""
+    repo, ref, paths = args.get("repo"), args.get("ref") or "HEAD", args.get("paths") or ["."]
+    if not isinstance(paths, list) or any(str(p).startswith("-") for p in [ref, *paths]):
+        raise ValueError("ref and paths can't start with '-', and paths must be a list")
+    out = subprocess.run(["git", "-C", str(repo), "diff", "--no-color", "--no-ext-diff", "--no-textconv", str(ref),
+                          "--", *map(str, paths), *EXCLUDE],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+    if out.returncode:
+        raise RuntimeError(f"git diff failed: {out.stderr.strip()[:1000]}")
+    if not out.stdout.strip():
+        raise ValueError(f"no tracked changes for git diff {ref}; new files show up once staged or committed")
+    focus = args.get("focus")
+    return (f"Review this change (git diff {ref} -- {' '.join(map(str, paths))}).\n"
+            + (f"Focus: {focus}\n" if focus else "") + f"\n```diff\n{out.stdout}```")
+
+
 def call_tool(config, name, args):
-    alias, prompt, system = args.get("model"), args.get("prompt", ""), args.get("system")
+    alias = args.get("model")
+    if name == "review":
+        prompt, system = review_prompt(args), REVIEW_SYSTEM
+    else:
+        prompt, system = args.get("prompt", ""), args.get("system")
     prompt, redacted = scrub(config, prompt)
     if system:
         system, more = scrub(config, system)
@@ -150,22 +178,48 @@ def call_tool(config, name, args):
     return f'<second_opinion model="{alias}"{tokens}>\n{text}\n</second_opinion>\n{note}'
 
 
-def ask_tool(config):
-    return {
+def tools(config):
+    model = {"type": "string", "enum": list(config["models"]), "description": "Configured model alias"}
+    annotations = {"readOnlyHint": True, "openWorldHint": True}
+    return [{
         "name": "ask",
-        "description": ("Ask another AI model for a second opinion: a code review, a design check, a fact check. "
-                        "The model sees only what you send, so put the code, diff or context in the prompt."),
+        "description": ("Ask another AI model for a second opinion: a design check, a fact check, or code you paste in. "
+                        "It sees only what you send. Ask neutrally: don't share your own conclusion, and for code "
+                        "ask for `file:line | severity | issue` lines. Secrets are redacted before sending. "
+                        "The reply is unverified: check each point before acting on it."),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "model": {"type": "string", "enum": list(config["models"]), "description": "Configured model alias"},
+                "model": model,
                 "prompt": {"type": "string", "description": "The question, with all the context it needs"},
                 "system": {"type": "string", "description": "Optional system prompt, e.g. a reviewer role"},
             },
             "required": ["model", "prompt"],
         },
-        "annotations": {"readOnlyHint": True, "openWorldHint": True},
-    }
+        "annotations": annotations,
+    }, {
+        "name": "review",
+        "description": ("Have another AI model review a code change. The server runs `git diff <ref> -- <paths>` in "
+                        "the repo itself, so don't paste code: tracked files only, .env*, *.pem and *.key are left "
+                        "out and secrets are redacted. Findings come back as `file:line | severity | issue` lines "
+                        "and are unverified: check each against the code before acting on it."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "model": model,
+                "repo": {"type": "string", "description": "Absolute path of the git repository"},
+                "ref": {"type": "string", "description": ("What git diff compares against: a commit or range such as "
+                                                          "HEAD~1 or main...my-branch. Default HEAD: uncommitted "
+                                                          "changes to tracked files")},
+                "paths": {"type": "array", "items": {"type": "string"},
+                          "description": "Only diff these paths, relative to the repo"},
+                "focus": {"type": "string", "description": ("Optional area to look at, e.g. 'error handling'. "
+                                                            "Don't include your own verdict")},
+            },
+            "required": ["model", "repo"],
+        },
+        "annotations": annotations,
+    }]
 
 
 def _error(request_id, code, message):
@@ -185,8 +239,8 @@ def handle(config, request):
     elif method == "ping":
         result = {}
     elif method == "tools/list":
-        result = {"tools": [ask_tool(config)]}
-    elif method == "tools/call" and params.get("name") == "ask":
+        result = {"tools": tools(config)}
+    elif method == "tools/call" and params.get("name") in ("ask", "review"):
         try:
             text, failed = call_tool(config, params["name"], params.get("arguments") or {}), False
         except Exception as e:  # any failure goes back to the model as a tool error, not a crash

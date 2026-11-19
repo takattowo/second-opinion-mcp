@@ -112,8 +112,81 @@ def test_tools_list_offers_configured_models(fake_api):
 
     tools = second_opinion.handle(config, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})["result"]["tools"]
 
-    assert [t["name"] for t in tools] == ["ask"]
-    assert tools[0]["inputSchema"]["properties"]["model"]["enum"] == ["m", "other"]
+    assert [t["name"] for t in tools] == ["ask", "review"]
+    assert [t["inputSchema"]["properties"]["model"]["enum"] for t in tools] == [["m", "other"]] * 2
+
+
+@pytest.fixture
+def repo(tmp_path):
+    """Git repo with one commit, then uncommitted edits to app.py, .env and server.pem, and an untracked file."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    env = {**os.environ, "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
+           "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com"}
+
+    def git(*args):
+        subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, env=env)
+
+    (root / "app.py").write_text("def add(a, b):\n    return a + b\n")
+    (root / ".env").write_text("NAME=one\n")
+    (root / "server.pem").write_text("cert one\n")
+    git("init", "-q")
+    git("add", "app.py", ".env", "server.pem")
+    git("-c", "commit.gpgsign=false", "commit", "-q", "-m", "init")
+    (root / "app.py").write_text("def add(a, b):\n    return a - b\n")
+    (root / ".env").write_text("NAME=two\n")
+    (root / "server.pem").write_text("cert two\n")
+    (root / "new.py").write_text("untracked = True\n")
+    return root
+
+
+def test_review_sends_the_tracked_diff_without_secret_files(fake_api, repo, monkeypatch):
+    monkeypatch.setenv("TEST_KEY", "sk-test")
+    fake_api["reply"] = OK
+
+    result = call(config_for(fake_api["url"], "openai", "/v1"), "review",
+                  {"model": "m", "repo": str(repo), "focus": "arithmetic"})
+
+    assert result["isError"] is False
+    messages = fake_api["requests"][0]["body"]["messages"]
+    assert "file:line | severity | issue" in messages[0]["content"]
+    user = messages[1]["content"]
+    assert "-    return a + b" in user and "+    return a - b" in user
+    assert "Focus: arithmetic" in user
+    for hidden in (".env", "NAME=two", "server.pem", "cert two", "untracked"):
+        assert hidden not in user
+
+
+def test_review_of_only_excluded_files_is_an_error(fake_api, repo, monkeypatch):
+    monkeypatch.setenv("TEST_KEY", "sk-test")
+
+    result = call(config_for(fake_api["url"], "openai", "/v1"), "review",
+                  {"model": "m", "repo": str(repo), "paths": [".env", "server.pem"]})
+
+    assert result["isError"] is True
+    assert "no tracked changes" in text_of(result)
+    assert fake_api["requests"] == []
+
+
+@pytest.mark.parametrize("args", [{"ref": "--output=x.txt"}, {"paths": ["--cached"]}])
+def test_review_refuses_option_like_arguments(fake_api, repo, monkeypatch, args):
+    monkeypatch.setenv("TEST_KEY", "sk-test")
+
+    result = call(config_for(fake_api["url"], "openai", "/v1"), "review", {"model": "m", "repo": str(repo), **args})
+
+    assert result["isError"] is True
+    assert not (repo / "x.txt").exists()
+    assert fake_api["requests"] == []
+
+
+def test_review_outside_a_repo_is_an_error(fake_api, tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_KEY", "sk-test")
+
+    result = call(config_for(fake_api["url"], "openai", "/v1"), "review", {"model": "m", "repo": str(tmp_path)})
+
+    assert result["isError"] is True
+    assert "git diff failed" in text_of(result)
+    assert fake_api["requests"] == []
 
 
 def test_tool_result_is_wrapped_and_marked_unverified(fake_api, monkeypatch):
