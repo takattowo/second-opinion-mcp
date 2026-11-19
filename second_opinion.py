@@ -152,6 +152,7 @@ def review_prompt(args):
         raise ValueError("ref and paths can't start with '-', and paths must be a list")
     out = subprocess.run(["git", "-C", str(repo), "diff", "--no-color", "--no-ext-diff", "--no-textconv",
                           "--submodule=short", str(ref), "--", *map(str, paths), *EXCLUDE],
+                         stdin=subprocess.DEVNULL,  # the server's stdin is the client's pipe; on Windows git hangs on it
                          capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
     if out.returncode:
         raise RuntimeError(f"git diff failed: {out.stderr.strip()[:1000]}")

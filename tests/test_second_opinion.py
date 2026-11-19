@@ -178,6 +178,30 @@ def test_review_does_not_inline_submodule_files(fake_api, repo, tmp_path, monkey
     assert "from-submodule" not in sent_prompt(fake_api)
 
 
+def test_review_answers_while_stdin_stays_open(fake_api, repo, tmp_path):
+    # a real client keeps stdin open; on Windows a git child that inherits it can hang
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config_for(fake_api["url"], "openai", "/v1")))
+    fake_api["reply"] = OK
+    proc = subprocess.Popen([sys.executable, second_opinion.__file__], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+                            env={**os.environ, "SECOND_OPINION_CONFIG": str(path), "TEST_KEY": "sk-test"})
+    try:
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "review", "arguments": {"model": "m", "repo": str(repo)}}}) + "\n")
+        proc.stdin.flush()
+        lines = []
+        reader = threading.Thread(target=lambda: lines.append(proc.stdout.readline()), daemon=True)
+        reader.start()
+        reader.join(20)
+
+        assert lines, "no reply while stdin was open"
+        assert json.loads(lines[0])["result"]["isError"] is False
+    finally:
+        proc.kill()
+        proc.wait()
+
+
 def test_review_of_only_excluded_files_is_an_error(fake_api, repo, monkeypatch):
     monkeypatch.setenv("TEST_KEY", "sk-test")
 
