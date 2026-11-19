@@ -27,7 +27,8 @@ REVIEW_SYSTEM = ("You are reviewing a code change you have not seen before. Look
                  "`file:line | severity | issue`, with severity blocker, bug or minor. Say when a finding depends on "
                  "code outside the diff. If you find nothing, reply `no findings`.")
 # never sent by review, even when named in paths
-EXCLUDE = (":(exclude,glob)**/.env*", ":(exclude,glob)**/*.pem", ":(exclude,glob)**/*.key")
+EXCLUDE = tuple(f":(exclude,glob)**/{p}" for p in (".env*", "*.pem", "*.key", "*.p12", "*.pfx",
+                                                  "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*"))
 # shortcut: common secret shapes only, not a full scanner; add patterns as new key formats turn up
 SECRET_PATTERNS = [
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
@@ -35,9 +36,10 @@ SECRET_PATTERNS = [
     (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "[REDACTED]"),
     (re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{20,}"), "[REDACTED]"),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}"), "[REDACTED]"),
-    # .env-style NAME_KEY=value lines (diff +/- prefix allowed); the value must look like a literal, so code is kept
+    # .env-style NAME_KEY=value lines (diff +/- prefix allowed). The value runs to a quote, space or line end;
+    # a value that looks like code (a call or an index) is kept, as is one an earlier pattern already redacted.
     (re.compile(r"(?m)^([-+ ]?\s*(?:export\s+)?[A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD)[A-Z0-9_]*"
-                r"\s*[=:]\s*[\"']?)[A-Za-z0-9_./+=-]{8,}(?=[\"'\s]|$)"), r"\1[REDACTED]"),
+                r"\s*[=:]\s*[\"']?)(?!\[REDACTED|[A-Za-z_][\w.]*[(\[])[^\s\"']{8,}"), r"\1[REDACTED]"),
 ]
 
 
@@ -175,6 +177,7 @@ def call_tool(config, name, args):
         raise ValueError(f"prompt is {size} chars, over max_chars ({limit}): send a smaller slice, "
                          "or raise max_chars in the config")
     text, usage = ask(config, alias, prompt, system)
+    text = re.sub(r"(?i)</second_opinion", "&lt;/second_opinion", text)  # the reply can't end the wrapper early
     tokens = "".join(f' {k}="{v}"' for k, v in usage.items() if v is not None)
     note = UNVERIFIED + (f" {redacted} secret(s) were redacted before sending." if redacted else "")
     return f'<second_opinion model="{alias}"{tokens}>\n{text}\n</second_opinion>\n{note}'
@@ -202,8 +205,9 @@ def tools(config):
     }, {
         "name": "review",
         "description": ("Have another AI model review a code change. The server runs `git diff <ref> -- <paths>` in "
-                        "the repo itself, so don't paste code: tracked files only, .env*, *.pem and *.key are left "
-                        "out and secrets are redacted. Findings come back as `file:line | severity | issue` lines "
+                        "the repo itself, so don't paste code: tracked files only, key files (.env*, *.pem, *.key, "
+                        "id_rsa, ...) are left out and secrets are redacted. Findings come back as "
+                        "`file:line | severity | issue` lines "
                         "and are unverified: check each against the code before acting on it."),
         "inputSchema": {
             "type": "object",
@@ -233,6 +237,8 @@ def handle(config, request):
     if "id" not in request:
         return None
     method, params = request.get("method"), request.get("params") or {}
+    if not isinstance(params, dict):
+        return _error(request["id"], -32602, "params must be an object")
     if method == "initialize":
         asked = params.get("protocolVersion")
         result = {"protocolVersion": asked if asked in PROTOCOLS else PROTOCOLS[0],
@@ -270,7 +276,10 @@ def main():
                 print(json.dumps(response), flush=True)
 
     def respond(request):
-        send(handle(config, request))
+        try:
+            send(handle(config, request))
+        except Exception as e:  # every request gets an answer, even when handling it hits a bug
+            send(_error(request.get("id"), -32603, f"internal error: {type(e).__name__}: {e}"))
 
     for line in sys.stdin:
         if not line.strip():

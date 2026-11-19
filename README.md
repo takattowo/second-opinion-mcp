@@ -28,10 +28,12 @@ Unverified second opinion: check each point against the code before acting on it
 ## What leaves your machine
 
 - `ask` sends only the prompt and system prompt. `review` sends the diff, not whole files.
-- `review` leaves out `.env*`, `*.pem` and `*.key` files, even when you name them in `paths`.
+- `review` leaves out key files (`.env*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa` and the other SSH key names),
+  even when you name them in `paths`.
 - Before sending, both tools redact your configured API keys and common secret shapes: AWS access keys, private key
   blocks, `sk-` and `ghp_` style tokens, and `.env`-style `NAME_KEY=value` lines. The reply says how many were
-  redacted. This catches common patterns only; it is not a secret scanner.
+  redacted. This catches common patterns only; it is not a secret scanner. A private key in a file with another
+  name is only caught when the diff shows its whole `BEGIN`…`END` block.
 - A prompt over `max_chars` (default 200,000) is refused instead of sent.
 - Redirects are not followed, so the key is only ever sent to `base_url`.
 - `review` runs `git diff` in the repo you name, so only point it at repos you trust: a repo's own git config can
