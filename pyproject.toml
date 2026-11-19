@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "second-opinion-mcp"
+dynamic = ["version"]
+description = "MCP server that asks another model (OpenAI, Claude, DeepSeek, Azure Foundry, ...) for a second opinion"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{name = "second-opinion-mcp contributors"}]
+keywords = ["mcp", "llm", "openai", "anthropic", "azure", "deepseek", "code-review"]
+dependencies = []
+
+[project.scripts]
+second-opinion-mcp = "second_opinion:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools]
+py-modules = ["second_opinion"]
+
+[tool.setuptools.dynamic]
+version = {attr = "second_opinion.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
